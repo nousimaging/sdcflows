@@ -240,7 +240,7 @@ def init_topup_wf(
     return workflow
 
 
-def init_3dQwarp_wf(omp_nthreads=1, debug=False, name="pepolar_estimate_wf"):
+def init_3dQwarp_wf(omp_nthreads=1, debug=False, sloppy=False, name="pepolar_estimate_wf"):
     """
     Create the PEPOLAR field estimation workflow based on AFNI's ``3dQwarp``.
 

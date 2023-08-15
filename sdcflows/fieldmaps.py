@@ -444,7 +444,7 @@ class FieldmapEstimation:
         # Override workflow name
         kwargs["name"] = f"wf_{self.bids_id}"
 
-        if self.method in (EstimatorType.MAPPED, EstimatorType.PHASEDIFF):
+        if self.method == EstimatorType.MAPPED:
             from .workflows.fit.fieldmap import init_fmap_wf
 
             kwargs["mode"] = str(self.method).rpartition(".")[-1].lower()
@@ -458,10 +458,10 @@ class FieldmapEstimation:
                 if f.suffix in ("fieldmap", "phasediff", "phase2", "phase1")
             ]
         elif self.method == EstimatorType.PEPOLAR:
-            from .workflows.fit.pepolar import init_topup_wf
+            from .workflows.fit.pepolar import init_3dQwarp_wf
 
-            self._wf = init_topup_wf(**kwargs)
-        elif self.method == EstimatorType.ANAT:
+            self._wf = init_3dQwarp_wf(**kwargs)
+        elif self.method in (EstimatorType.ANAT, EstimatorType.PHASEDIFF):
             from .workflows.fit.syn import init_syn_sdc_wf
 
             self._wf = init_syn_sdc_wf(**kwargs)
