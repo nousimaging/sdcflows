@@ -27,220 +27,14 @@ from nipype.interfaces import utility as niu
 from niworkflows.engine.workflows import LiterateWorkflow as Workflow
 
 from ... import data
+from ...interfaces.brainmask import FixHeaderSynthStrip, CopyXForm
 
 INPUT_FIELDS = ("metadata", "in_data")
 _PEPOLAR_DESC = """\
 A *B<sub>0</sub>*-nonuniformity map (or *fieldmap*) was estimated based on two (or more)
 echo-planar imaging (EPI) references """
 
-
-def init_topup_wf(
-    grid_reference=0,
-    omp_nthreads=1,
-    sloppy=False,
-    debug=False,
-    name="pepolar_estimate_wf",
-):
-    """
-    Create the PEPOLAR field estimation workflow based on FSL's ``topup``.
-
-    Workflow Graph
-        .. workflow ::
-            :graph2use: orig
-            :simple_form: yes
-
-            from sdcflows.workflows.fit.pepolar import init_topup_wf
-            wf = init_topup_wf()
-
-    Parameters
-    ----------
-    grid_reference : :obj:`int`
-        Index of the volume (after flattening) that will be taken for gridding reference.
-    sloppy : :obj:`bool`
-        Whether a fast configuration of topup (less accurate) should be applied.
-    debug : :obj:`bool`
-        Run in debug mode
-    name : :obj:`str`
-        Name for this workflow
-    omp_nthreads : :obj:`int`
-        Parallelize internal tasks across the number of CPUs given by this option.
-
-    Inputs
-    ------
-    in_data : :obj:`list` of :obj:`str`
-        A list of EPI files that will be fed into TOPUP.
-    metadata : :obj:`list` of :obj:`dict`
-        A list of dictionaries containing the metadata corresponding to each file
-        in ``in_data``.
-
-    Outputs
-    -------
-    fmap : :obj:`str`
-        The path of the estimated fieldmap.
-    fmap_ref : :obj:`str`
-        The path of an unwarped conversion of files in ``in_data``.
-    fmap_mask : :obj:`str`
-        The path of mask corresponding to the ``fmap_ref`` output.
-    fmap_coeff : :obj:`str` or :obj:`list` of :obj:`str`
-        The path(s) of the B-Spline coefficients supporting the fieldmap.
-    method: :obj:`str`
-        Short description of the estimation method that was run.
-
-    """
-    from nipype.interfaces.fsl.epi import TOPUP
-    from niworkflows.interfaces.nibabel import MergeSeries, ReorientImage
-    from niworkflows.interfaces.images import RobustAverage
-
-    from ...utils.misc import front as _front
-    from ...interfaces.epi import GetReadoutTime, SortPEBlips
-    from ...interfaces.utils import UniformGrid, PadSlices, ReorientImageAndMetadata
-    from ...interfaces.bspline import TOPUPCoeffReorient
-    from ..ancillary import init_brainextraction_wf
-
-    workflow = Workflow(name=name)
-    workflow.__desc__ = f"""\
-{_PEPOLAR_DESC} with `topup` (@topup; FSL {TOPUP().version}).
-"""
-
-    inputnode = pe.Node(niu.IdentityInterface(fields=INPUT_FIELDS), name="inputnode")
-    outputnode = pe.Node(
-        niu.IdentityInterface(
-            fields=[
-                "fmap",
-                "fmap_ref",
-                "fmap_coeff",
-                "fmap_mask",
-                "jacobians",
-                "xfms",
-                "out_warps",
-                "method",
-            ]
-        ),
-        name="outputnode",
-    )
-    outputnode.inputs.method = "PEB/PEPOLAR (phase-encoding based / PE-POLARity)"
-
-    # Calculate the total readout time of each run
-    readout_time = pe.MapNode(
-        GetReadoutTime(),
-        name="readout_time",
-        iterfield=["metadata", "in_file"],
-        run_without_submitting=True,
-    )
-    # Average each run so that topup is not overwhelmed (see #279)
-    runwise_avg = pe.MapNode(
-        RobustAverage(num_threads=omp_nthreads),
-        name="runwise_avg",
-        iterfield="in_file",
-    )
-    # Regrid all to the reference (grid_reference=0 means first averaged run)
-    regrid = pe.Node(UniformGrid(reference=grid_reference), name="regrid")
-    # Sort PE blips to ensure reproducibility
-    sort_pe_blips = pe.Node(SortPEBlips(), name="sort_pe_blips", run_without_submitting=True)
-    # Merge into one 4D file
-    concat_blips = pe.Node(MergeSeries(affine_tolerance=1e-4), name="concat_blips")
-    # Pad dimensions so that they meet TOPUP's expectations
-    pad_blip_slices = pe.Node(PadSlices(), name="pad_blip_slices")
-    # Run 3dVolReg between runs: uses RobustAverage for consistency and to generate
-    # debugging artifacts (typically, one wants to look at the average across uncorrected runs)
-    setwise_avg = pe.Node(RobustAverage(num_threads=omp_nthreads), name="setwise_avg")
-    # The core of the implementation
-    # Feed the input images in LAS orientation, so FSL does not run funky reorientations
-    to_las = pe.Node(ReorientImageAndMetadata(target_orientation="LAS"), name="to_las")
-    topup = pe.Node(
-        TOPUP(
-            config=str(data.load(f"flirtsch/b02b0{'_quick' * sloppy}.cnf"))
-        ),
-        name="topup",
-    )
-    # "Generalize" topup coefficients and store them in a spatially-correct NIfTI file
-    fix_coeff = pe.Node(
-        TOPUPCoeffReorient(), name="fix_coeff", run_without_submitting=True
-    )
-
-    # Average the output
-    ref_average = pe.Node(RobustAverage(num_threads=omp_nthreads), name="ref_average")
-
-    # Sophisticated brain extraction of fMRIPrep
-    brainextraction_wf = init_brainextraction_wf()
-
-    # fmt: off
-    workflow.connect([
-        (inputnode, runwise_avg, [("in_data", "in_file")]),
-        (inputnode, readout_time, [("metadata", "metadata")]),
-        (runwise_avg, regrid, [("out_file", "in_data")]),
-        (regrid, readout_time, [("out_data", "in_file")]),
-        (regrid, sort_pe_blips, [("out_data", "in_data")]),
-        (readout_time, sort_pe_blips, [("readout_time", "readout_times"),
-                                       ("pe_dir_fsl", "pe_dirs_fsl")]),
-        (sort_pe_blips, topup, [("readout_times", "readout_times")]),
-        (setwise_avg, fix_coeff, [("out_file", "fmap_ref")]),
-        (sort_pe_blips, concat_blips, [("out_data", "in_files")]),
-        (concat_blips, pad_blip_slices, [("out_file", "in_file")]),
-        (pad_blip_slices, setwise_avg, [("out_file", "in_file")]),
-        (setwise_avg, to_las, [("out_hmc_volumes", "in_file")]),
-        (sort_pe_blips, to_las, [("pe_dirs_fsl", "pe_dir")]),
-        (to_las, topup, [
-            ("out_file", "in_file"),
-            ("pe_dir", "encoding_direction"),
-        ]),
-        (topup, fix_coeff, [("out_fieldcoef", "in_coeff")]),
-        (to_las, fix_coeff, [(("pe_dir", _front), "pe_dir")]),
-        (topup, outputnode, [("out_jacs", "jacobians"),
-                             ("out_mats", "xfms")]),
-        (ref_average, brainextraction_wf, [("out_file", "inputnode.in_file")]),
-        (brainextraction_wf, outputnode, [
-            ("outputnode.out_file", "fmap_ref"),
-            ("outputnode.out_mask", "fmap_mask")
-        ]),
-        (fix_coeff, outputnode, [("out_coeff", "fmap_coeff")]),
-    ])
-    # fmt: on
-
-    if not debug:
-        # Roll orientation back to original
-        from_las = pe.Node(ReorientImage(), name="from_las")
-        from_las_fmap = pe.Node(ReorientImage(), name="from_las_fmap")
-        # fmt: off
-        workflow.connect([
-            (setwise_avg, from_las, [("out_file", "target_file")]),
-            (setwise_avg, from_las_fmap, [("out_file", "target_file")]),
-            (topup, from_las, [("out_corrected", "in_file")]),
-            (from_las, ref_average, [("out_file", "in_file")]),
-            (topup, from_las_fmap, [("out_field", "in_file")]),
-            (topup, outputnode, [("out_warps", "out_warps")]),
-            (from_las_fmap, outputnode, [("out_file", "fmap")]),
-        ])
-        # fmt: on
-        return workflow
-
-    from niworkflows.interfaces.nibabel import SplitSeries
-    from ...interfaces.bspline import ApplyCoeffsField
-
-    # Separate the runs again, as our ApplyCoeffsField corrects them separately
-    split_blips = pe.Node(SplitSeries(), name="split_blips")
-    unwarp = pe.Node(ApplyCoeffsField(), name="unwarp")
-    unwarp.interface._always_run = True
-    concat_corrected = pe.Node(MergeSeries(), name="concat_corrected")
-
-    # fmt:off
-    workflow.connect([
-        (fix_coeff, unwarp, [("out_coeff", "in_coeff")]),
-        (setwise_avg, split_blips, [("out_hmc_volumes", "in_file")]),
-        (split_blips, unwarp, [("out_files", "in_data")]),
-        (sort_pe_blips, unwarp, [("readout_times", "ro_time"),
-                                 ("pe_dirs", "pe_dir")]),
-        (unwarp, outputnode, [("out_warp", "out_warps"),
-                              ("out_field", "fmap")]),
-        (unwarp, concat_corrected, [("out_corrected", "in_files")]),
-        (concat_corrected, ref_average, [("out_file", "in_file")]),
-    ])
-    # fmt:on
-
-    return workflow
-
-
-def init_3dQwarp_wf(omp_nthreads=1, debug=False, name="pepolar_estimate_wf"):
+def init_3dQwarp_wf(omp_nthreads=1, debug=False, sloppy=False, name="pepolar_estimate_wf"):
     """
     Create the PEPOLAR field estimation workflow based on AFNI's ``3dQwarp``.
 
@@ -285,7 +79,6 @@ def init_3dQwarp_wf(omp_nthreads=1, debug=False, name="pepolar_estimate_wf"):
         FixHeaderApplyTransforms as ApplyTransforms,
     )
     from niworkflows.interfaces.freesurfer import StructuralReference
-    from niworkflows.func.util import init_enhance_and_skullstrip_bold_wf
     from ...utils.misc import front as _front, last as _last
     from ...interfaces.utils import Flatten, ConvertWarp
 
@@ -442,3 +235,220 @@ def _sorted_pe(inlist):
             ref_pe[0]
         ],
     )
+
+def init_enhance_and_skullstrip_bold_wf(
+    brainmask_thresh=0.5,
+    name="enhance_and_skullstrip_bold_wf",
+    omp_nthreads=1,
+    pre_mask=False,
+):
+    """
+    Pulled from niworkflows. FSL removed
+    Enhance and run brain extraction on a BOLD EPI image.
+
+    This workflow takes in a :abbr:`BOLD (blood-oxygen level-dependant)`
+    :abbr:`fMRI (functional MRI)` average/summary (e.g., a reference image
+    averaging non-steady-state timepoints), and sharpens the histogram
+    with the application of the N4 algorithm for removing the
+    :abbr:`INU (intensity non-uniformity)` bias field and calculates a signal
+    mask.
+
+    Steps of this workflow are:
+
+      1. Calculate a tentative mask by registering (9-parameters) to *fMRIPrep*'s
+         :abbr:`EPI (echo-planar imaging)` -*boldref* template, which
+         is in MNI space.
+         The tentative mask is obtained by resampling the MNI template's
+         brainmask into *boldref*-space.
+      2. Binary dilation of the tentative mask with a sphere of 3mm diameter.
+      3. Run ANTs' ``N4BiasFieldCorrection`` on the input
+         :abbr:`BOLD (blood-oxygen level-dependant)` average, using the
+         mask generated in 1) instead of the internal Otsu thresholding.
+      4. Skullstrip with freesurfer's synthstrip
+      5. Apply final mask on the enhanced reference.
+
+    Step 1 can be skipped if the ``pre_mask`` argument is set to ``True`` and
+    a tentative mask is passed in to the workflow through the ``pre_mask``
+    Nipype input.
+
+
+    Workflow graph
+        .. workflow ::
+            :graph2use: orig
+            :simple_form: yes
+
+            from niworkflows.func.util import init_enhance_and_skullstrip_bold_wf
+            wf = init_enhance_and_skullstrip_bold_wf(omp_nthreads=1)
+
+    .. _N4BiasFieldCorrection: https://hdl.handle.net/10380/3053
+
+    Parameters
+    ----------
+    brainmask_thresh: :obj:`float`
+        Lower threshold for the probabilistic brainmask to obtain
+        the final binary mask (default: 0.5).
+    name : str
+        Name of workflow (default: ``enhance_and_skullstrip_bold_wf``)
+    omp_nthreads : int
+        number of threads available to parallel nodes
+    pre_mask : bool
+        Indicates whether the ``pre_mask`` input will be set (and thus, step 1
+        should be skipped).
+
+    Inputs
+    ------
+    in_file : str
+        BOLD image (single volume)
+    pre_mask : bool
+        A tentative brain mask to initialize the workflow (requires ``pre_mask``
+        parameter set ``True``).
+
+
+    Outputs
+    -------
+    bias_corrected_file : str
+        the ``in_file`` after `N4BiasFieldCorrection`_
+    skull_stripped_file : str
+        the ``bias_corrected_file`` after skull-stripping
+    mask_file : str
+        mask of the skull-stripped input file
+    out_report : str
+        reportlet for the skull-stripping
+
+    """
+    from niworkflows.interfaces.nibabel import ApplyMask, BinaryDilation
+    from niworkflows.interfaces.fixes import FixN4BiasFieldCorrection as N4BiasFieldCorrection
+
+    workflow = Workflow(name=name)
+    inputnode = pe.Node(
+        niu.IdentityInterface(fields=["in_file", "pre_mask"]), name="inputnode"
+    )
+    outputnode = pe.Node(
+        niu.IdentityInterface(
+            fields=["mask_file", "skull_stripped_file", "bias_corrected_file"]
+        ),
+        name="outputnode",
+    )
+
+    # Run N4 normally, force num_threads=1 for stability (images are small, no need for >1)
+    n4_correct = pe.Node(
+        N4BiasFieldCorrection(
+            dimension=3, copy_header=True, bspline_fitting_distance=200
+        ),
+        shrink_factor=2,
+        name="n4_correct",
+        n_procs=1,
+    )
+    n4_correct.inputs.rescale_intensities = True
+
+    # Create a generous BET mask out of the bias-corrected EPI
+    synthstrip = pe.Node(FixHeaderSynthStrip(), name = "synthstrip")
+
+    # Use AFNI's unifize for T2 contrast & fix header
+    #unifize = pe.Node(
+        #afni.Unifize(
+            #t2=True,
+            #outputtype="NIFTI_GZ",
+            # Default -clfrac is 0.1, 0.4 was too conservative
+            # -rbt because I'm a Jedi AFNI Master (see 3dUnifize's documentation)
+            #args="-clfrac 0.2 -rbt 18.3 65.0 90.0",
+            #out_file="uni.nii.gz",
+        #),
+        #name="unifize",
+    #)
+    #fixhdr_unifize = pe.Node(CopyXForm(), name="fixhdr_unifize", mem_gb=0.1)
+
+    #fixhdr_skullstrip = pe.Node(CopyXForm(), name="fixhdr_skullstrip", mem_gb=0.1)
+    #fixhdr_mask = pe.Node(CopyXForm(), name="fixhdr_mask", mem_gb=0.1)
+
+    # Compute masked brain
+    #apply_mask = pe.Node(ApplyMask(), name="apply_mask")
+
+    if not pre_mask:
+        from nipype.interfaces.ants.utils import AI
+
+        bold_template = get_template(
+            "MNI152NLin2009cAsym", resolution=2, desc="fMRIPrep", suffix="boldref"
+        )
+        brain_mask = get_template(
+            "MNI152NLin2009cAsym", resolution=2, desc="brain", suffix="mask"
+        )
+
+        # Initialize transforms with antsAI
+        init_aff = pe.Node(
+            AI(
+                fixed_image=str(bold_template),
+                fixed_image_mask=str(brain_mask),
+                metric=("Mattes", 32, "Regular", 0.2),
+                transform=("Affine", 0.1),
+                search_factor=(20, 0.12),
+                principal_axes=False,
+                convergence=(10, 1e-6, 10),
+                verbose=True,
+            ),
+            name="init_aff",
+            n_procs=omp_nthreads,
+        )
+
+        # Registration().version may be None
+        if parseversion(Registration().version or "0.0.0") > Version("2.2.0"):
+            init_aff.inputs.search_grid = (40, (0, 40, 40))
+
+        # Set up spatial normalization
+        norm = pe.Node(
+            Registration(from_file=data.load("epi_atlasbased_brainmask.json")),
+            name="norm",
+            n_procs=omp_nthreads,
+        )
+        norm.inputs.fixed_image = str(bold_template)
+        map_brainmask = pe.Node(
+            ApplyTransforms(
+                interpolation="Linear",
+                # Use the higher resolution and probseg for numerical stability in rounding
+                input_image=str(
+                    get_template(
+                        "MNI152NLin2009cAsym",
+                        resolution=1,
+                        label="brain",
+                        suffix="probseg",
+                    )
+                ),
+            ),
+            name="map_brainmask",
+        )
+        # Ensure mask's header matches reference's
+        check_hdr = pe.Node(MatchHeader(), name="check_hdr", run_without_submitting=True)
+
+        # fmt: off
+        workflow.connect([
+            (inputnode, check_hdr, [("in_file", "reference")]),
+            (inputnode, init_aff, [("in_file", "moving_image")]),
+            (inputnode, map_brainmask, [("in_file", "reference_image")]),
+            (inputnode, norm, [("in_file", "moving_image")]),
+            (init_aff, norm, [("output_transform", "initial_moving_transform")]),
+            (norm, map_brainmask, [
+                ("reverse_invert_flags", "invert_transform_flags"),
+                ("reverse_transforms", "transforms"),
+            ]),
+            (map_brainmask, check_hdr, [("output_image", "in_file")]),
+            (check_hdr, n4_correct, [("out_file", "weight_image")]),
+        ])
+        # fmt: on
+    else:
+        # fmt: off
+        workflow.connect([
+            (inputnode, n4_correct, [("pre_mask", "weight_image")]),
+        ])
+        # fmt: on
+
+    # fmt: off
+    workflow.connect([
+        (inputnode, n4_correct, [("in_file", "input_image")]),
+        (n4_correct, synthstrip, [("output_image", "input_file")]),
+        (synthstrip, outputnode, [("out_brain", "in_file")]),
+        (synthstrip, outputnode, [("out_brain_mask", "in_mask")]),
+        (n4_correct, outputnode, [("output_image", "bias_corrected_file")]),
+    ])
+    # fmt: on
+
+    return workflow
