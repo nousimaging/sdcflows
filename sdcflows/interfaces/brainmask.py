@@ -30,7 +30,10 @@ from nipype.interfaces.base import (
 )
 from nipype.interfaces.freesurfer.base import FSTraitedSpecOpenMP, FSCommandOpenMP
 from ..utils.tools import brain_masker
-
+import os.path as op
+import nibabel as nb
+import numpy as np
+import shutil
 
 class _BrainExtractionInputSpec(BaseInterfaceInputSpec):
     in_file = File(exists=True, mandatory=True, desc="file to mask")
@@ -83,6 +86,57 @@ class BinaryDilation(SimpleInterface):
             self.inputs.radius,
             newpath=runtime.cwd,
         )
+        return runtime
+    
+def _copyxform(ref_image, out_image, message=None):
+    # Read in reference and output
+    # Use mmap=False because we will be overwriting the output image
+    resampled = nb.load(out_image, mmap=False)
+    orig = nb.load(ref_image)
+
+    if not np.allclose(orig.affine, resampled.affine):
+        print(
+            'Affines of input and reference images do not match, '
+            'FMRIPREP will set the reference image headers. '
+            'Please, check that the x-form matrices of the input dataset'
+            'are correct and manually verify the alignment of results.')
+
+    # Copy xform infos
+    qform, qform_code = orig.header.get_qform(coded=True)
+    sform, sform_code = orig.header.get_sform(coded=True)
+    header = resampled.header.copy()
+    header.set_qform(qform, int(qform_code))
+    header.set_sform(sform, int(sform_code))
+    header['descrip'] = 'xform matrices modified by %s.' % (message or '(unknown)')
+
+    newimg = resampled.__class__(resampled.get_fdata(), orig.affine, header)
+    newimg.to_filename(out_image)
+
+class CopyXFormInputSpec(BaseInterfaceInputSpec):
+    in_file = File(exists=True, mandatory=True, desc='the file we get the data from')
+    hdr_file = File(exists=True, mandatory=True, desc='the file we get the header from')
+
+
+class CopyXFormOutputSpec(TraitedSpec):
+    out_file = File(exists=True, desc='written file path')
+
+
+class CopyXForm(SimpleInterface):
+    """
+    Copy the x-form matrices from `hdr_file` to `out_file`.
+    """
+    input_spec = CopyXFormInputSpec
+    output_spec = CopyXFormOutputSpec
+
+    def _run_interface(self, runtime):
+        out_name = fname_presuffix(self.inputs.in_file,
+                                   suffix='_xform',
+                                   newpath=runtime.cwd)
+        # Copy and replace header
+        shutil.copy(self.inputs.in_file, out_name)
+        _copyxform(self.inputs.hdr_file, out_name,
+                   message='CopyXForm (niworkflows 0.5.2post5)')
+        self._results['out_file'] = out_name
         return runtime
     
 class _SynthStripInputSpec(FSTraitedSpecOpenMP):
