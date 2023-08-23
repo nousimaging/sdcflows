@@ -3,7 +3,7 @@ attrs>=20.1.0
 nibabel>=3.1.0
 nipype<2.0,>=1.8.5
 traits<6.4
-niworkflows>=1.7.0
+#niworkflows>=1.7.0
 nitransforms>=21.0.0
 numpy>=1.21.0
 pybids>=0.15.1
