@@ -465,7 +465,7 @@ class FieldmapEstimation:
                 self._wf.inputs.inputnode.fieldmap = [
                     (str(f.path.absolute()), f.metadata)
                     for f in self.sources
-                    if f.suffix in ("fieldmap", "phasediff", "phase2", "phase1")
+                    if f.suffix in ("fieldmap")
                 ]
         elif self.method == EstimatorType.PEPOLAR:
             from .workflows.fit.pepolar import init_3dQwarp_wf
