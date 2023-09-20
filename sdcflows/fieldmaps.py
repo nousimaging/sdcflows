@@ -445,18 +445,28 @@ class FieldmapEstimation:
         kwargs["name"] = f"wf_{self.bids_id}"
 
         if self.method == EstimatorType.MAPPED:
-            from .workflows.fit.fieldmap import init_fmap_wf
+            phdiff = False
+            for f in self.sources:
+                if f.suffix in ("phasediff","phase1","phase2"):
+                    phdiff = True
+                    break
+            
+            if phdiff == True:
+                from .workflows.fit.syn import init_syn_sdc_wf
+                self._wf = init_syn_sdc_wf(**kwargs)
+            else:
+                from .workflows.fit.fieldmap import init_fmap_wf
 
-            kwargs["mode"] = str(self.method).rpartition(".")[-1].lower()
-            self._wf = init_fmap_wf(**kwargs)
-            self._wf.inputs.inputnode.magnitude = [
-                str(f.path.absolute()) for f in self.sources if f.suffix.startswith("magnitude")
-            ]
-            self._wf.inputs.inputnode.fieldmap = [
-                (str(f.path.absolute()), f.metadata)
-                for f in self.sources
-                if f.suffix in ("fieldmap", "phasediff", "phase2", "phase1")
-            ]
+                kwargs["mode"] = str(self.method).rpartition(".")[-1].lower()
+                self._wf = init_fmap_wf(**kwargs)
+                self._wf.inputs.inputnode.magnitude = [
+                    str(f.path.absolute()) for f in self.sources if f.suffix.startswith("magnitude")
+                ]
+                self._wf.inputs.inputnode.fieldmap = [
+                    (str(f.path.absolute()), f.metadata)
+                    for f in self.sources
+                    if f.suffix in ("fieldmap", "phasediff", "phase2", "phase1")
+                ]
         elif self.method == EstimatorType.PEPOLAR:
             from .workflows.fit.pepolar import init_3dQwarp_wf
 
