@@ -136,52 +136,29 @@ def init_fmap_wf(omp_nthreads=1, sloppy=False, debug=False, mode="phasediff", na
     ])
     # fmt: on
 
-    if mode == "phasediff":
-        workflow.__desc__ = """\
-A *B<sub>0</sub>* nonuniformity map (or *fieldmap*) was estimated from the
-phase-drift map(s) measure with two consecutive GRE (gradient-recalled echo)
-acquisitions.
-"""
-        phdiff_wf = init_phdiff_wf(omp_nthreads, debug=debug)
-        outputnode.inputs.method = "FMB (fieldmap-based) - phase-difference map"
+    from niworkflows.interfaces.images import IntraModalMerge
+    from ...interfaces.fmap import CheckB0Units
 
-        # fmt: off
-        workflow.connect([
-            (unzip, phdiff_wf, [("meta", "inputnode.phase_meta")]),
-            (check_register, phdiff_wf, [("fmap_files", "inputnode.phase")]),
-            (magnitude_wf, phdiff_wf, [
-                ("outputnode.fmap_ref", "inputnode.magnitude"),
-                ("outputnode.fmap_mask", "inputnode.mask"),
-            ]),
-            (phdiff_wf, bs_filter, [
-                ("outputnode.fieldmap", "in_data"),
-            ]),
-        ])
-        # fmt: on
-    else:
-        from niworkflows.interfaces.images import IntraModalMerge
-        from ...interfaces.fmap import CheckB0Units
-
-        workflow.__desc__ = """\
+    workflow.__desc__ = """\
 A *B<sub>0</sub>* nonuniformity map (or *fieldmap*) was directly measured with
 an MRI scheme designed with that purpose such as SEI (Spiral-Echo Imaging).
 """
-        outputnode.inputs.method = "FMB (fieldmap-based) - directly measured B0 map"
-        # Merge input fieldmap images (assumes all are given in the same units!)
-        fmapmrg = pe.Node(
-            IntraModalMerge(zero_based_avg=False, hmc=False, to_ras=False),
-            name="fmapmrg",
-        )
-        units = pe.Node(CheckB0Units(), name="units", run_without_submitting=True)
+    outputnode.inputs.method = "FMB (fieldmap-based) - directly measured B0 map"
+    # Merge input fieldmap images (assumes all are given in the same units!)
+    fmapmrg = pe.Node(
+        IntraModalMerge(zero_based_avg=False, hmc=False, to_ras=False),
+        name="fmapmrg",
+    )
+    units = pe.Node(CheckB0Units(), name="units", run_without_submitting=True)
 
-        # fmt: off
-        workflow.connect([
-            (inputnode, units, [(("fieldmap", _get_units), "units")]),
-            (check_register, fmapmrg, [("fmap_files", "in_files")]),
-            (fmapmrg, units, [("out_avg", "in_file")]),
-            (units, bs_filter, [("out_file", "in_data")]),
-        ])
-        # fmt: on
+    # fmt: off
+    workflow.connect([
+        (inputnode, units, [(("fieldmap", _get_units), "units")]),
+        (check_register, fmapmrg, [("fmap_files", "in_files")]),
+        (fmapmrg, units, [("out_avg", "in_file")]),
+        (units, bs_filter, [("out_file", "in_data")]),
+    ])
+    # fmt: on
 
     return workflow
 
@@ -250,111 +227,6 @@ def init_magnitude_wf(omp_nthreads, name="magnitude_wf"):
     ])
     # fmt: on
     return workflow
-
-
-def init_phdiff_wf(omp_nthreads, debug=False, name="phdiff_wf"):
-    r"""
-    Generate a :math:`B_0` field from consecutive-phases and phase-difference maps.
-
-    This workflow preprocess phase-difference maps (or generates the phase-difference
-    map should two ``phase1``/``phase2`` be provided at the input), and generates
-    an image equivalent to BIDS's ``fieldmap`` that can be processed with the
-    general fieldmap workflow.
-
-    Besides phase2 - phase1 subtraction, the core of this particular workflow relies
-    in the phase-unwrapping with FSL PRELUDE [Jenkinson2003]_.
-    FSL PRELUDE takes wrapped maps in the range 0 to 6.28, `as per the user guide
-    <https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FUGUE/Guide#Step_2_-_Getting_.28wrapped.29_phase_in_radians>`__.
-
-    For the phase-difference maps, recentering back to :math:`[-\pi \dotsb \pi )`
-    is necessary.
-    After some massaging and with the scaling of the echo separation factor
-    :math:`\Delta \text{TE}`, the phase-difference maps are converted into
-    an actual :math:`B_0` map in Hz units.
-
-    Workflow Graph
-        .. workflow ::
-            :graph2use: orig
-            :simple_form: yes
-
-            from sdcflows.workflows.fit.fieldmap import init_phdiff_wf
-            wf = init_phdiff_wf(omp_nthreads=1)
-
-    Parameters
-    ----------
-    omp_nthreads : :obj:`int`
-        Maximum number of threads an individual process may use
-    debug : :obj:`bool`
-        Run in debug mode
-    name : :obj:`str`
-        Name of workflow (default: ``phdiff_wf``)
-
-    Inputs
-    ------
-    magnitude : :obj:`os.PathLike`
-        A reference magnitude image preprocessed elsewhere.
-    phase : :obj:`list` of :obj:`tuple` of (:obj:`os.PathLike`, :obj:`dict`)
-        List containing one GRE phase-difference map with its corresponding metadata
-        (requires ``EchoTime1`` and ``EchoTime2``), or the phase maps for the two
-        subsequent echoes, with their metadata (requires ``EchoTime``).
-    mask : :obj:`os.PathLike`
-        A brain mask calculated from the magnitude image.
-
-    Outputs
-    -------
-    fieldmap : :obj:`os.PathLike`
-        The estimated fieldmap in Hz.
-
-    """
-    from nipype.interfaces.fsl import PRELUDE
-    from ...interfaces.fmap import Phasediff2Fieldmap, PhaseMap2rads, SubtractPhases
-
-    workflow = Workflow(name=name)
-    workflow.__desc__ = f"""\
-The corresponding phase-map(s) were phase-unwrapped with `prelude` (FSL {PRELUDE().version}).
-"""
-
-    inputnode = pe.Node(
-        niu.IdentityInterface(fields=["magnitude", "phase", "phase_meta", "mask"]),
-        name="inputnode",
-    )
-
-    outputnode = pe.Node(
-        niu.IdentityInterface(fields=["fieldmap"]),
-        name="outputnode",
-    )
-
-    # phase diff -> radians
-    phmap2rads = pe.MapNode(
-        PhaseMap2rads(),
-        name="phmap2rads",
-        iterfield=["in_file"],
-        run_without_submitting=True,
-    )
-    # FSL PRELUDE will perform phase-unwrapping
-    prelude = pe.Node(PRELUDE(), name="prelude")
-
-    calc_phdiff = pe.Node(
-        SubtractPhases(), name="calc_phdiff", run_without_submitting=True
-    )
-    calc_phdiff.interface._always_run = debug
-    compfmap = pe.Node(Phasediff2Fieldmap(), name="compfmap")
-
-    # fmt: off
-    workflow.connect([
-        (inputnode, phmap2rads, [("phase", "in_file")]),
-        (inputnode, calc_phdiff, [("phase_meta", "in_meta")]),
-        (inputnode, prelude, [("magnitude", "magnitude_file"),
-                              ("mask", "mask_file")]),
-        (phmap2rads, calc_phdiff, [("out_file", "in_phases")]),
-        (calc_phdiff, prelude, [("phase_diff", "phase_file")]),
-        (calc_phdiff, compfmap, [("metadata", "metadata")]),
-        (prelude, compfmap, [("unwrapped_phase_file", "in_file")]),
-        (compfmap, outputnode, [("out_file", "fieldmap")]),
-    ])
-    # fmt: on
-    return workflow
-
 
 def _get_file(intuple):
     """
